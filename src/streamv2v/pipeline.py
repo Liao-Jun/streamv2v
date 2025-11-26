@@ -1,5 +1,5 @@
-import glob
-import os
+# pipeline.py with restored helper methods AND CORRECT BATCHING FOR CFG
+
 import time
 from typing import List, Optional, Union, Any, Dict, Tuple, Literal
 from collections import deque
@@ -8,505 +8,334 @@ import numpy as np
 import PIL.Image
 import torch
 import torch.nn.functional as F
-from torchvision.models.optical_flow import raft_small
 
 from diffusers import LCMScheduler, StableDiffusionPipeline
 from diffusers.image_processor import VaeImageProcessor
-from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img import (
-    retrieve_latents,
-)
-from .image_utils import postprocess_image, forward_backward_consistency_check
-from .models.utils import get_nn_latent
-from .image_filter import SimilarImageFilter
+from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img import retrieve_latents
 
+from .image_utils import postprocess_image
+from .models.attention_processor import MultiStateAttentionProcessor
+from . import flow_utils
 
 class StreamV2V:
     def __init__(
         self,
         pipe: StableDiffusionPipeline,
-        t_index_list: List[int],
+        strength: float,
         torch_dtype: torch.dtype = torch.float16,
         width: int = 512,
         height: int = 512,
-        do_add_noise: bool = True,
         use_denoising_batch: bool = True,
         frame_buffer_size: int = 1,
         cfg_type: Literal["none", "full", "self", "initialize"] = "self",
+        use_multi_state_attn: bool = True,
+        memory_bank_size: int = 5,
+        motion_threshold: float = 2.0,
+        quality_threshold: float = 0.2,
     ) -> None:
         self.device = pipe.device
         self.dtype = torch_dtype
         self.generator = None
+        self.frame_counter = 0
 
         self.height = height
         self.width = width
-
         self.latent_height = int(height // pipe.vae_scale_factor)
         self.latent_width = int(width // pipe.vae_scale_factor)
 
         self.frame_bff_size = frame_buffer_size
-        self.denoising_steps_num = len(t_index_list)
-
+        self.strength = strength
         self.cfg_type = cfg_type
-
-        if use_denoising_batch:
-            self.batch_size = self.denoising_steps_num * frame_buffer_size
-            if self.cfg_type == "initialize":
-                self.trt_unet_batch_size = (
-                    self.denoising_steps_num + 1
-                ) * self.frame_bff_size
-            elif self.cfg_type == "full":
-                self.trt_unet_batch_size = (
-                    2 * self.denoising_steps_num * self.frame_bff_size
-                )
-            else:
-                self.trt_unet_batch_size = self.denoising_steps_num * frame_buffer_size
-        else:
-            self.trt_unet_batch_size = self.frame_bff_size
-            self.batch_size = frame_buffer_size
-
-        self.t_list = t_index_list
-
-        self.do_add_noise = do_add_noise
         self.use_denoising_batch = use_denoising_batch
-
-        self.similar_image_filter = False
-        self.similar_filter = SimilarImageFilter()
-        self.prev_image_tensor = None
-        self.prev_x_t_latent = None
-        self.prev_image_result = None
 
         self.pipe = pipe
         self.image_processor = VaeImageProcessor(pipe.vae_scale_factor)
-
         self.scheduler = LCMScheduler.from_config(self.pipe.scheduler.config)
         self.text_encoder = pipe.text_encoder
         self.unet = pipe.unet
         self.vae = pipe.vae
 
-        self.cached_x_t_latent = deque(maxlen=4)
+        self.use_multi_state_attn = use_multi_state_attn
+        if self.use_multi_state_attn:
+            print("Multi-State Attention is enabled.")
+            self.flow_model = flow_utils.get_flow_model(self.device)
+            self.memory_bank = deque(maxlen=memory_bank_size)
+            self.static_anchor_kv = None
+            self.motion_threshold = motion_threshold
+            self.quality_threshold = quality_threshold
+            self.prev_output_latents = None
+            self.prev_kv = None
+            self.flow_accum_since_keyframe = None
 
-        self.inference_time_ema = 0
+    # Restored Methods
+    def load_lcm_lora(self, pretrained_model_name_or_path_or_dict, adapter_name='lcm', **kwargs) -> None:
+        self.pipe.load_lora_weights(pretrained_model_name_or_path_or_dict, adapter_name, **kwargs)
 
-    def load_lcm_lora(
-        self,
-        pretrained_model_name_or_path_or_dict: Union[
-            str, Dict[str, torch.Tensor]
-        ] = "latent-consistency/lcm-lora-sdv1-5",
-        adapter_name: Optional[Any] = 'lcm',
-        **kwargs,
-    ) -> None:
-        self.pipe.load_lora_weights(
-            pretrained_model_name_or_path_or_dict, adapter_name, **kwargs
-        )
+    def load_lora(self, pretrained_lora_model_name_or_path_or_dict, adapter_name=None, **kwargs) -> None:
+        self.pipe.load_lora_weights(pretrained_lora_model_name_or_path_or_dict, adapter_name, **kwargs)
 
-    def load_lora(
-        self,
-        pretrained_lora_model_name_or_path_or_dict: Union[str, Dict[str, torch.Tensor]],
-        adapter_name: Optional[Any] = None,
-        **kwargs,
-    ) -> None:
-        self.pipe.load_lora_weights(
-            pretrained_lora_model_name_or_path_or_dict, adapter_name, **kwargs
-        )
-
-    def fuse_lora(
-        self,
-        fuse_unet: bool = True,
-        fuse_text_encoder: bool = True,
-        lora_scale: float = 1.0,
-        safe_fusing: bool = False,
-    ) -> None:
-        self.pipe.fuse_lora(
-            fuse_unet=fuse_unet,
-            fuse_text_encoder=fuse_text_encoder,
-            lora_scale=lora_scale,
-            safe_fusing=safe_fusing,
-        )
-
-    def enable_similar_image_filter(self, threshold: float = 0.98, max_skip_frame: float = 10) -> None:
-        self.similar_image_filter = True
-        self.similar_filter.set_threshold(threshold)
-        self.similar_filter.set_max_skip_frame(max_skip_frame)
-
-    def disable_similar_image_filter(self) -> None:
-        self.similar_image_filter = False
+    def fuse_lora(self, fuse_unet=True, fuse_text_encoder=True, lora_scale=1.0, safe_fusing=False) -> None:
+        self.pipe.fuse_lora(fuse_unet=fuse_unet, fuse_text_encoder=fuse_text_encoder, lora_scale=lora_scale, safe_fusing=safe_fusing)
+    
+    @torch.no_grad()
+    def update_prompt(self, prompt: str) -> None:
+        # Re-encode prompt without batching; batching done in unet_step
+        do_classifier_free_guidance = self.guidance_scale > 1.0
+        encoder_output = self.pipe.encode_prompt(prompt, self.device, 1, do_classifier_free_guidance)
+        self.prompt_embeds_cond = encoder_output[0] # (1, 77, 768)
+        if do_classifier_free_guidance:
+            self.prompt_embeds_uncond = encoder_output[1] # (1, 77, 768)
+        else:
+            self.prompt_embeds_uncond = None
 
     @torch.no_grad()
     def prepare(
         self,
         prompt: str,
         negative_prompt: str = "",
-        num_inference_steps: int = 50,
+        num_inference_steps: int = 4,
         guidance_scale: float = 1.2,
-        delta: float = 1.0,
-        generator: Optional[torch.Generator] = torch.Generator(),
         seed: int = 2,
+        strength: float = 0.6,
     ) -> None:
-        self.generator = generator
-        self.generator.manual_seed(seed)
-        # initialize x_t_latent (it can be any random tensor)
-        if self.denoising_steps_num > 1:
-            self.x_t_latent_buffer = torch.zeros(
-                (
-                    (self.denoising_steps_num - 1) * self.frame_bff_size,
-                    4,
-                    self.latent_height,
-                    self.latent_width,
-                ),
-                dtype=self.dtype,
-                device=self.device,
-            )
+        self.generator = torch.Generator(device=self.device).manual_seed(seed)
+        self.guidance_scale = 1.0 if self.cfg_type == "none" else guidance_scale
+
+        do_classifier_free_guidance = self.guidance_scale > 1.0
+        encoder_output = self.pipe.encode_prompt(prompt, self.device, 1, do_classifier_free_guidance, negative_prompt)
+        
+        self.prompt_embeds_cond = encoder_output[0]
+        if do_classifier_free_guidance:
+            self.prompt_embeds_uncond = encoder_output[1]
         else:
-            self.x_t_latent_buffer = None
+            self.prompt_embeds_uncond = None
 
-        if self.cfg_type == "none":
-            self.guidance_scale = 1.0
-        else:
-            self.guidance_scale = guidance_scale
-        self.delta = delta
-
-        do_classifier_free_guidance = False
-        if self.guidance_scale > 1.0:
-            do_classifier_free_guidance = True
-
-        encoder_output = self.pipe.encode_prompt(
-            prompt=prompt,
-            device=self.device,
-            num_images_per_prompt=1,
-            do_classifier_free_guidance=True,
-            negative_prompt=negative_prompt,
-        )
-
-        self.prompt_embeds = encoder_output[0].repeat(self.batch_size, 1, 1)
-        self.null_prompt_embeds = encoder_output[1]
-
-        if self.use_denoising_batch and self.cfg_type == "full":
-            uncond_prompt_embeds = encoder_output[1].repeat(self.batch_size, 1, 1)
-        elif self.cfg_type == "initialize":
-            uncond_prompt_embeds = encoder_output[1].repeat(self.frame_bff_size, 1, 1)
-
-        if self.guidance_scale > 1.0 and (
-            self.cfg_type == "initialize" or self.cfg_type == "full"
-        ):
-            self.prompt_embeds = torch.cat(
-                [uncond_prompt_embeds, self.prompt_embeds], dim=0
-            )
-
+        # 1. Set timesteps using the correct number of steps
         self.scheduler.set_timesteps(num_inference_steps, self.device)
-        self.timesteps = self.scheduler.timesteps.to(self.device)
 
-        # make sub timesteps list based on the indices in the t_list list and the values in the timesteps list
-        self.sub_timesteps = []
-        for t in self.t_list:
-            self.sub_timesteps.append(self.timesteps[t])
+        # 2. Calculate offset and starting timestep based on strength (standard LCM logic)
+        offset = self.scheduler.config.get("steps_offset", 0)
+        init_timestep_idx = int(num_inference_steps * strength) + offset
+        init_timestep_idx = min(init_timestep_idx, num_inference_steps)
+        
+        # The latent needs to be created with noise for the *first* timestep in the schedule
+        self.latent_timestep = self.scheduler.timesteps[init_timestep_idx]
 
-        sub_timesteps_tensor = torch.tensor(
-            self.sub_timesteps, dtype=torch.long, device=self.device
-        )
-        self.sub_timesteps_tensor = torch.repeat_interleave(
-            sub_timesteps_tensor,
-            repeats=self.frame_bff_size if self.use_denoising_batch else 1,
-            dim=0,
-        )
+        # 3. Get the actual timesteps to run on, slicing from the calculated start
+        self.sub_timesteps = self.scheduler.timesteps[init_timestep_idx:].tolist()
+        self.sub_timesteps_tensor = self.scheduler.timesteps[init_timestep_idx:]
 
-        self.init_noise = torch.randn(
-            (self.batch_size, 4, self.latent_height, self.latent_width),
-            generator=generator,
-        ).to(device=self.device, dtype=self.dtype)
-
-        self.randn_noise = self.init_noise[:1].clone()
-        self.warp_noise = self.init_noise[:1].clone()
-
-        self.stock_noise = torch.zeros_like(self.init_noise)
-
-        c_skip_list = []
-        c_out_list = []
-        for timestep in self.sub_timesteps:
-            c_skip, c_out = self.scheduler.get_scalings_for_boundary_condition_discrete(
-                timestep
-            )
-            c_skip_list.append(c_skip)
-            c_out_list.append(c_out)
-
-        self.c_skip = (
-            torch.stack(c_skip_list)
-            .view(len(self.t_list), 1, 1, 1)
-            .to(dtype=self.dtype, device=self.device)
-        )
-        self.c_out = (
-            torch.stack(c_out_list)
-            .view(len(self.t_list), 1, 1, 1)
-            .to(dtype=self.dtype, device=self.device)
-        )
-
-        alpha_prod_t_sqrt_list = []
-        beta_prod_t_sqrt_list = []
-        for timestep in self.sub_timesteps:
-            alpha_prod_t_sqrt = self.scheduler.alphas_cumprod[timestep].sqrt()
-            beta_prod_t_sqrt = (1 - self.scheduler.alphas_cumprod[timestep]).sqrt()
-            alpha_prod_t_sqrt_list.append(alpha_prod_t_sqrt)
-            beta_prod_t_sqrt_list.append(beta_prod_t_sqrt)
-        alpha_prod_t_sqrt = (
-            torch.stack(alpha_prod_t_sqrt_list)
-            .view(len(self.t_list), 1, 1, 1)
-            .to(dtype=self.dtype, device=self.device)
-        )
-        beta_prod_t_sqrt = (
-            torch.stack(beta_prod_t_sqrt_list)
-            .view(len(self.t_list), 1, 1, 1)
-            .to(dtype=self.dtype, device=self.device)
-        )
-        self.alpha_prod_t_sqrt = torch.repeat_interleave(
-            alpha_prod_t_sqrt,
-            repeats=self.frame_bff_size if self.use_denoising_batch else 1,
-            dim=0,
-        )
-        self.beta_prod_t_sqrt = torch.repeat_interleave(
-            beta_prod_t_sqrt,
-            repeats=self.frame_bff_size if self.use_denoising_batch else 1,
-            dim=0,
-        )
-
-    @torch.no_grad()
-    def update_prompt(self, prompt: str) -> None:
-        encoder_output = self.pipe.encode_prompt(
-            prompt=prompt,
-            device=self.device,
-            num_images_per_prompt=1,
-            do_classifier_free_guidance=False,
-        )
-        self.prompt_embeds = encoder_output[0].repeat(self.batch_size, 1, 1)
-
-    def add_noise(
-        self,
-        original_samples: torch.Tensor,
-        noise: torch.Tensor,
-        t_index: int,
-    ) -> torch.Tensor:
-        noisy_samples = (
-            self.alpha_prod_t_sqrt[t_index] * original_samples
-            + self.beta_prod_t_sqrt[t_index] * noise
-        )
-        return noisy_samples
-
-    def scheduler_step_batch(
-        self,
-        model_pred_batch: torch.Tensor,
-        x_t_latent_batch: torch.Tensor,
-        idx: Optional[int] = None,
-    ) -> torch.Tensor:
-        # TODO: use t_list to select beta_prod_t_sqrt
-        if idx is None:
-            F_theta = (
-                x_t_latent_batch - self.beta_prod_t_sqrt * model_pred_batch
-            ) / self.alpha_prod_t_sqrt
-            denoised_batch = self.c_out * F_theta + self.c_skip * x_t_latent_batch
-        else:
-            F_theta = (
-                x_t_latent_batch - self.beta_prod_t_sqrt[idx] * model_pred_batch
-            ) / self.alpha_prod_t_sqrt[idx]
-            denoised_batch = (
-                self.c_out[idx] * F_theta + self.c_skip[idx] * x_t_latent_batch
+        # 4. Recalculate batch size and prepare scheduler constants for the *actual* number of steps
+        self.denoising_steps_num = len(self.sub_timesteps)
+        self.batch_size = self.denoising_steps_num * self.frame_bff_size if self.use_denoising_batch else self.frame_bff_size
+        
+        if self.batch_size > 0:
+            self.init_noise = torch.randn(
+                (self.batch_size, 4, self.latent_height, self.latent_width),
+                generator=self.generator, device=self.device, dtype=self.dtype
             )
 
-        return denoised_batch
+            c_skip_list, c_out_list, alpha_list, beta_list = [], [], [], []
+            for t in self.sub_timesteps:
+                c_skip, c_out = self.scheduler.get_scalings_for_boundary_condition_discrete(t)
+                alpha_prod_t_sqrt = self.scheduler.alphas_cumprod[t].sqrt()
+                beta_prod_t_sqrt = (1 - self.scheduler.alphas_cumprod[t]).sqrt()
+                c_skip_list.append(torch.tensor(c_skip, device=self.device, dtype=self.dtype))
+                c_out_list.append(torch.tensor(c_out, device=self.device, dtype=self.dtype))
+                alpha_list.append(alpha_prod_t_sqrt)
+                beta_list.append(beta_prod_t_sqrt)
 
-    def unet_step(
-        self,
-        x_t_latent: torch.Tensor,
-        t_list: Union[torch.Tensor, list[int]],
-        idx: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.guidance_scale > 1.0 and (self.cfg_type == "initialize"):
-            x_t_latent_plus_uc = torch.concat([x_t_latent[0:1], x_t_latent], dim=0)
-            t_list = torch.concat([t_list[0:1], t_list], dim=0)
-        elif self.guidance_scale > 1.0 and (self.cfg_type == "full"):
-            x_t_latent_plus_uc = torch.concat([x_t_latent, x_t_latent], dim=0)
-            t_list = torch.concat([t_list, t_list], dim=0)
+            self.c_skip = torch.stack(c_skip_list).view(-1, 1, 1, 1).to(device=self.device, dtype=self.dtype)
+            self.c_out = torch.stack(c_out_list).view(-1, 1, 1, 1).to(device=self.device, dtype=self.dtype)
+            self.alpha_prod_t_sqrt = torch.stack(alpha_list).view(-1, 1, 1, 1).to(device=self.device, dtype=self.dtype)
+            self.beta_prod_t_sqrt = torch.stack(beta_list).view(-1, 1, 1, 1).to(device=self.device, dtype=self.dtype)
+
+    def add_noise(self, x: torch.Tensor) -> torch.Tensor:
+        noise = torch.randn(x.shape, generator=self.generator, device=x.device, dtype=x.dtype)
+        return self.scheduler.add_noise(x, noise, self.latent_timestep)
+
+    def unet_step(self, x_t: torch.Tensor, t_input: torch.Tensor, **kwargs) -> torch.Tensor:
+        """
+        Performs a single UNet denoising step.
+        x_t: Latent input to the UNet (batch_size_actual, C, H, W)
+        t_input: Timesteps for this batch (batch_size_actual,)
+        """
+        current_latent_batch_size = x_t.shape[0]
+
+        if self.guidance_scale > 1.0:
+            latent_model_input = torch.cat([x_t] * 2)
+            # Repeat uncond and cond prompt embeds to match current_latent_batch_size * 2
+            prompt_embeds_for_unet = torch.cat([
+                self.prompt_embeds_uncond.repeat(current_latent_batch_size, 1, 1),
+                self.prompt_embeds_cond.repeat(current_latent_batch_size, 1, 1)
+            ])
+            # Repeat timesteps to match new batch size
+            t_for_unet = t_input.repeat(2)
         else:
-            x_t_latent_plus_uc = x_t_latent
+            latent_model_input = x_t
+            # Repeat cond prompt embeds to match current_latent_batch_size
+            prompt_embeds_for_unet = self.prompt_embeds_cond.repeat(current_latent_batch_size, 1, 1)
+            t_for_unet = t_input
+        
+        # Slicing the alpha/beta/c_skip/c_out to match the actual batch size of x_t
+        # This is needed because self.alpha_prod_t_sqrt etc. might be of size self.batch_size (e.g. 4)
+        # but x_t here might be a smaller batch (e.g., 1 or 2).
+        alpha_prod_t_sqrt_slice = self.alpha_prod_t_sqrt[:x_t.shape[0]]
+        beta_prod_t_sqrt_slice = self.beta_prod_t_sqrt[:x_t.shape[0]]
+        c_out_slice = self.c_out[:x_t.shape[0]]
+        c_skip_slice = self.c_skip[:x_t.shape[0]]
 
         model_pred = self.unet(
-            x_t_latent_plus_uc,
-            t_list,
-            encoder_hidden_states=self.prompt_embeds,
-            return_dict=False,
+            latent_model_input,
+            t_for_unet, # Use batch-matched timesteps
+            encoder_hidden_states=prompt_embeds_for_unet, # Use batch-matched prompt embeds
+            cross_attention_kwargs=kwargs, 
+            return_dict=False
         )[0]
-
-        if self.guidance_scale > 1.0 and (self.cfg_type == "initialize"):
-            noise_pred_text = model_pred[1:]
-            self.stock_noise = torch.concat(
-                [model_pred[0:1], self.stock_noise[1:]], dim=0
-            )  # ここコメントアウトでself out cfg
-        elif self.guidance_scale > 1.0 and (self.cfg_type == "full"):
-            noise_pred_uncond, noise_pred_text = model_pred.chunk(2)
-        else:
-            noise_pred_text = model_pred
-        if self.guidance_scale > 1.0 and (
-            self.cfg_type == "self" or self.cfg_type == "initialize"
-        ):
-            noise_pred_uncond = self.stock_noise * self.delta
-        if self.guidance_scale > 1.0 and self.cfg_type != "none":
-            model_pred = noise_pred_uncond + self.guidance_scale * (
-                noise_pred_text - noise_pred_uncond
-            )
-        else:
-            model_pred = noise_pred_text
-
-        # compute the previous noisy sample x_t -> x_t-1
-        if self.use_denoising_batch:
-            denoised_batch = self.scheduler_step_batch(model_pred, x_t_latent, idx)
-            if self.cfg_type == "self" or self.cfg_type == "initialize":
-                scaled_noise = self.beta_prod_t_sqrt * self.stock_noise
-                delta_x = self.scheduler_step_batch(model_pred, scaled_noise, idx)
-                alpha_next = torch.concat(
-                    [
-                        self.alpha_prod_t_sqrt[1:],
-                        torch.ones_like(self.alpha_prod_t_sqrt[0:1]),
-                    ],
-                    dim=0,
-                )
-                delta_x = alpha_next * delta_x
-                beta_next = torch.concat(
-                    [
-                        self.beta_prod_t_sqrt[1:],
-                        torch.ones_like(self.beta_prod_t_sqrt[0:1]),
-                    ],
-                    dim=0,
-                )
-                delta_x = delta_x / beta_next
-                init_noise = torch.concat(
-                    [self.init_noise[1:], self.init_noise[0:1]], dim=0
-                )
-                self.stock_noise = init_noise + delta_x
-
-        else:
-            # denoised_batch = self.scheduler.step(model_pred, t_list[0], x_t_latent).denoised
-            denoised_batch = self.scheduler_step_batch(model_pred, x_t_latent, idx)
-
-        return denoised_batch, model_pred
-
-
-    def norm_noise(self, noise):
-        # Compute mean and std of blended_noise
-        mean = noise.mean()
-        std = noise.std()
-
-        # Normalize blended_noise to have mean=0 and std=1
-        normalized_noise = (noise - mean) / std
-        return normalized_noise
         
-    def encode_image(self, image_tensors: torch.Tensor) -> torch.Tensor:        
-        image_tensors = image_tensors.to(
-            device=self.device,
-            dtype=self.vae.dtype,
-        )
-        img_latent = retrieve_latents(self.vae.encode(image_tensors), self.generator)
-        img_latent = img_latent * self.vae.config.scaling_factor
-        x_t_latent = self.add_noise(img_latent, self.init_noise[0], 0)
-        return x_t_latent
+        if self.guidance_scale > 1.0:
+            noise_pred_uncond, noise_pred_text = model_pred.chunk(2)
+            model_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-    def decode_image(self, x_0_pred_out: torch.Tensor) -> torch.Tensor:
-        output_latent = self.vae.decode(
-            x_0_pred_out / self.vae.config.scaling_factor, return_dict=False
-        )[0]
-        return output_latent
+        F_theta = (x_t - beta_prod_t_sqrt_slice * model_pred) / alpha_prod_t_sqrt_slice
+        return c_out_slice * F_theta + c_skip_slice * x_t
+
+    def _get_kv_from_unet(self):
+        kv_map = {}
+        # Sort by name to ensure order is consistent, which is important for reconstructing the KV storage
+        sorted_processors = sorted(self.unet.attn_processors.items())
+        for name, processor in sorted_processors:
+            if isinstance(processor, MultiStateAttentionProcessor):
+                if processor.last_key is not None and processor.last_value is not None:
+                    # Store on CPU to save VRAM
+                    kv_map[name] = (processor.last_key.cpu(), processor.last_value.cpu())
+        return kv_map
+
+    def encode_image(self, img_tensor: torch.Tensor) -> torch.Tensor:
+        img_latent = self.vae.encode(img_tensor.to(device=self.device, dtype=self.dtype)).latents
+        img_latent *= self.vae.config.scaling_factor
+        return self.add_noise(img_latent)
+
+    def decode_image(self, latents: torch.Tensor) -> torch.Tensor:
+        return self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
 
     def predict_x0_batch(self, x_t_latent: torch.Tensor) -> torch.Tensor:
-        prev_latent_batch = self.x_t_latent_buffer
-        if self.use_denoising_batch:
-            t_list = self.sub_timesteps_tensor
-            if self.denoising_steps_num > 1:
-                x_t_latent = torch.cat((x_t_latent, prev_latent_batch), dim=0)
-                self.stock_noise = torch.cat(
-                    (self.init_noise[0:1], self.stock_noise[:-1]), dim=0
-                )
-            x_0_pred_batch, model_pred = self.unet_step(x_t_latent, t_list)
+        cross_attention_kwargs = {}
+        flow_src = None # Initialize flow_src
+        if self.use_multi_state_attn and self.frame_counter > 0:
+            # --- Prepare per-layer KVs for the Attention Processor ---
+            prev_kvs_by_layer = {}
+            bank_kvs_by_layer = {}
 
-            if self.denoising_steps_num > 1:
-                x_0_pred_out = x_0_pred_batch[-1].unsqueeze(0)
-                if self.do_add_noise:
-                    self.x_t_latent_buffer = (
-                        self.alpha_prod_t_sqrt[1:] * x_0_pred_batch[:-1]
-                        + self.beta_prod_t_sqrt[1:] * self.init_noise[1:]
-                    )
-                else:
-                    self.x_t_latent_buffer = (
-                        self.alpha_prod_t_sqrt[1:] * x_0_pred_batch[:-1]
-                    )
-            else:
-                x_0_pred_out = x_0_pred_batch
-                self.x_t_latent_buffer = None
+            # 1. Calculate source flow
+            flow_src = flow_utils.calculate_flow(self.prev_output_latents, x_t_latent, self.flow_model, self.vae, self.vae.config.scaling_factor)
+
+            # 2. Warp previous KVs
+            for name, (k_prev, v_prev) in self.prev_kv.items():
+                k_prev = k_prev.to(self.device)
+                v_prev = v_prev.to(self.device)
+
+                # Mathematically derive h, w from seq_len and aspect ratio
+                b, seq_len, f = k_prev.shape
+                aspect_ratio = self.latent_width / self.latent_height
+                h = int((seq_len / aspect_ratio)**0.5)
+                w = round(seq_len / h)
+
+                # Reshape K, warp, and reshape back
+                k_prev_4d = k_prev.transpose(1, 2).view(b, f, h, w)
+                k_prev_warped_4d = flow_utils.warp(k_prev_4d, flow_src)
+                k_prev_warped = k_prev_warped_4d.view(b, f, seq_len).transpose(1, 2)
+
+                # Reshape V, warp, and reshape back
+                v_prev_4d = v_prev.transpose(1, 2).view(b, f, h, w)
+                v_prev_warped_4d = flow_utils.warp(v_prev_4d, flow_src)
+                v_prev_warped = v_prev_warped_4d.view(b, f, seq_len).transpose(1, 2)
+
+                prev_kvs_by_layer[name] = (k_prev_warped, v_prev_warped)
+
+            # 3. Assemble memory bank KVs
+            static_kvs = {name: (k.to(self.device), v.to(self.device)) for name, (k, v) in self.static_anchor_kv.items()}
+            
+            dynamic_kvs_list = []
+            for bank_item in self.memory_bank:
+                dynamic_kvs_list.append({name: (k.to(self.device), v.to(self.device)) for name, (k, v) in bank_item.items()})
+
+            for name in static_kvs.keys():
+                static_k, static_v = static_kvs[name]
+                dynamic_ks = [d[name][0] for d in dynamic_kvs_list]
+                dynamic_vs = [d[name][1] for d in dynamic_kvs_list]
+                
+                bank_k = torch.cat([static_k] + dynamic_ks, dim=1)
+                bank_v = torch.cat([static_v] + dynamic_vs, dim=1)
+                bank_kvs_by_layer[name] = (bank_k, bank_v)
+
+            # 4. Prepare discrepancy mask and final kwargs
+            flow_gen_approx = flow_src
+            discrepancy_mask = torch.norm(flow_src - flow_gen_approx, p=2, dim=1, keepdim=True)
+            discrepancy_mask = (discrepancy_mask - discrepancy_mask.min()) / (discrepancy_mask.max() - discrepancy_mask.min() + 1e-6)
+            
+            cross_attention_kwargs = {
+                "discrepancy_mask": discrepancy_mask,
+                "bank_kvs_by_layer": bank_kvs_by_layer,
+                "prev_kvs_by_layer": prev_kvs_by_layer,
+            }
+
+        # Handle denoising batch logic here
+        if self.use_denoising_batch and not self.use_multi_state_attn:
+            x_t_latent_input = x_t_latent.repeat(self.batch_size, 1, 1, 1)
+            t_input_for_unet_step = self.sub_timesteps_tensor
         else:
-            self.init_noise = x_t_latent
-            for idx, t in enumerate(self.sub_timesteps_tensor):
-                t = t.view(
-                    1,
-                ).repeat(
-                    self.frame_bff_size,
-                )
-                x_0_pred, model_pred = self.unet_step(x_t_latent, t, idx)
-                if idx < len(self.sub_timesteps_tensor) - 1:
-                    if self.do_add_noise:
-                        x_t_latent = self.alpha_prod_t_sqrt[
-                            idx + 1
-                        ] * x_0_pred + self.beta_prod_t_sqrt[
-                            idx + 1
-                        ] * torch.randn_like(
-                            x_0_pred, device=self.device, dtype=self.dtype
-                        )
-                    else:
-                        x_t_latent = self.alpha_prod_t_sqrt[idx + 1] * x_0_pred
-            x_0_pred_out = x_0_pred
+            x_t_latent_input = x_t_latent
+            t_input_for_unet_step = self.sub_timesteps_tensor[:x_t_latent.shape[0]]
+        
+        x_0_pred_out = self.unet_step(x_t_latent_input, t_input_for_unet_step, **cross_attention_kwargs)
+            
+        if self.use_multi_state_attn:
+            current_kv_map = self._get_kv_from_unet() # Returns a map {name: (k, v)} on CPU
+
+            if not current_kv_map:
+                print("Warning: Could not extract any KVs from UNet. Multi-state attention will be inactive.")
+            else:
+                if self.frame_counter == 0:
+                    self.static_anchor_kv = current_kv_map
+                else:
+                    if flow_src is not None:
+                        true_flow_gen = flow_utils.calculate_flow(self.prev_output_latents, x_0_pred_out, self.flow_model, self.vae, self.vae.config.scaling_factor)
+                        final_discrepancy = torch.norm(flow_src - true_flow_gen, p=2).mean()
+                        
+                        if self.flow_accum_since_keyframe is None:
+                            self.flow_accum_since_keyframe = flow_src
+                        else:
+                            self.flow_accum_since_keyframe = flow_utils.compose_flow(flow_src, self.flow_accum_since_keyframe)
+                        
+                        motion_magnitude = torch.norm(self.flow_accum_since_keyframe, p=2).mean()
+
+                        if motion_magnitude > self.motion_threshold and final_discrepancy < self.quality_threshold:
+                            print(f"Frame {self.frame_counter}: Adding new dynamic keyframe.")
+                            self.memory_bank.append(current_kv_map)
+                            self.flow_accum_since_keyframe = None
+
+                self.prev_output_latents = x_0_pred_out.clone()
+                self.prev_kv = current_kv_map
+            
+        self.frame_counter += 1
         return x_0_pred_out
 
     @torch.no_grad()
-    def __call__(
-        self, x: Union[torch.Tensor, PIL.Image.Image, np.ndarray] = None
-    ) -> torch.Tensor:
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        if x is not None:
-            x = self.image_processor.preprocess(x, self.height, self.width).to(
-                device=self.device, dtype=self.dtype
-            )
-            if self.similar_image_filter:
-                x = self.similar_filter(x)
-                if x is None:
-                    time.sleep(self.inference_time_ema)
-                    return self.prev_image_result
-            x_t_latent = self.encode_image(x)
-        else:
-            # TODO: check the dimension of x_t_latent
-            x_t_latent = torch.randn((1, 4, self.latent_height, self.latent_width)).to(
-                device=self.device, dtype=self.dtype
-            )
-        x_0_pred_out = self.predict_x0_batch(x_t_latent)
-        x_output = self.decode_image(x_0_pred_out).detach().clone()
+    def __call__(self, x: Union[torch.Tensor, PIL.Image.Image, np.ndarray]) -> torch.Tensor:
+        if not hasattr(self, "denoising_steps_num") or self.denoising_steps_num == 0:
+            return x
 
-        self.prev_image_result = x_output
-        end.record()
-        torch.cuda.synchronize()
-        inference_time = start.elapsed_time(end) / 1000
-        self.inference_time_ema = 0.9 * self.inference_time_ema + 0.1 * inference_time
-        return x_output
+        x = self.image_processor.preprocess(x, self.height, self.width).to(device=self.device, dtype=self.dtype)
+        x_t_latent = self.encode_image(x)
+        x_0_pred_out = self.predict_x0_batch(x_t_latent)
+        if self.use_denoising_batch and x_0_pred_out.shape[0] > 1:
+            x_0_pred_out = x_0_pred_out.mean(dim=0, keepdim=True)
+        return self.decode_image(x_0_pred_out).detach().clone()
 
     @torch.no_grad()
     def txt2img(self, batch_size: int = 1) -> torch.Tensor:
-        x_0_pred_out = self.predict_x0_batch(self.init_noise[0:1])
+        x_t_latent = torch.randn((batch_size, 4, self.latent_height, self.latent_width), device=self.device, dtype=self.dtype, generator=self.generator)
+        x_0_pred_out = self.predict_x0_batch(x_t_latent)
         x_output = self.decode_image(x_0_pred_out).detach().clone()
         return x_output
-
-    def txt2img_sd_turbo(self, batch_size: int = 1) -> torch.Tensor:
-        x_t_latent = self.init_noise[0:1]
-        model_pred = self.unet(
-            x_t_latent,
-            self.sub_timesteps_tensor,
-            encoder_hidden_states=self.prompt_embeds,
-            return_dict=False,
-        )[0]
-        x_0_pred_out = (
-            x_t_latent - self.beta_prod_t_sqrt * model_pred
-        ) / self.alpha_prod_t_sqrt
-        return self.decode_image(x_0_pred_out)
